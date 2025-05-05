@@ -1,0 +1,13 @@
+Our support handles queries related to food orders, payments, delivery issues, refunds, and account problems on the food delivery app.
+
+Supported topics include:
+- Order not received
+- Refunds for canceled orders
+- Wrong or missing items in order
+- Payment failure or double charge
+- Delayed delivery
+- Changing delivery address
+- Cancelling an ongoing order
+- Help with app login or signup
+
+We do not handle questions unrelated to the food delivery service, such as unrelated tech support, job applications, or app development queries.

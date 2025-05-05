@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+pymongo
+langchain
+groq
+langchain
+langchain-community
+mangum
+langchain-openai
+langchain-huggingface
