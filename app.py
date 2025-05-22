@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
@@ -11,20 +11,18 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-from api import chatbot  # Import router
+from api import chatbot
 from models.query_model import QueryRequest
-from core.db import messages_collection
+from core.db import messages_collection, friendrequests_collection, users_collection
+from api.auth import auth_router
+from api.auth import get_current_user, TokenData
+from models.auth import User
 
-from mangum import Mangum
+# load_dotenv()
+# os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+# os.environ["OPENAI_API_BASE"] = os.getenv("OPENAI_API_BASE")
 
-# # === Load Env ===
-load_dotenv()
-os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
-os.environ["OPENAI_API_BASE"] = os.getenv("OPENAI_API_BASE")
-
-# # === App ===
 app = FastAPI()
-lambda_handler = Mangum(app)
 origins = [
     "*",
 ]
@@ -37,7 +35,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# # === LLM & Vector DB Setup for Scope Checking ===
 llm = ChatOpenAI(model_name="gemma2-9b-it", temperature=0.3, max_tokens=512)
 embedding = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
@@ -59,7 +56,6 @@ retriever = db.as_retriever()
 qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, chain_type="stuff")
 
 
-# # === Scope Checker ===
 def is_in_scope(query: str) -> bool:
     result = qa_chain.invoke(
         {"query": f"Is this query related to food delivery app support? '{query}'"}
@@ -68,9 +64,7 @@ def is_in_scope(query: str) -> bool:
     return "yes" in result["result"].lower()
 
 
-# # === Models ===
 class ChatRequest(BaseModel):
-    user_id: str
     query: str
 
 
@@ -84,74 +78,182 @@ def root():
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat_route(req: ChatRequest):
+async def chat_route(query: ChatRequest, user: User = Depends(get_current_user)):
     try:
-        if is_in_scope(req.query):
-            # Delegate to agent-based chatbot
-            response = await chatbot.chat_with_bot(QueryRequest(user_query=req.query))
-
-            return ChatResponse(response=response["response"])
-        else:
-            return ChatResponse(
-                response="I'm here to assist only with food delivery app support-related questions."
-            )
+        print(f"user_id: {user.email}")
+        user_id = users_collection.find_one({"email": user.email})
+        if not user_id:
+            raise HTTPException(status_code=404, detail="User not found")
+        response = await chatbot.chat_with_bot(
+            QueryRequest(user_query=query.query), str(user_id["_id"])
+        )
+        print(f"response in chat_route: {response}")
+        return ChatResponse(response=response["response"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+# @app.post("/api/chat", response_model=ChatResponse)
+# async def chat_route(req: ChatRequest, user: User = Depends(get_current_user)):
+#     try:
+#         if is_in_scope(req.query):
+#             # Delegate to agent-based chatbot
+#             response = await chatbot.chat_with_bot(QueryRequest(user_query=req.query))
+
+#             return ChatResponse(response=response["response"])
+#         else:
+#             return ChatResponse(
+#                 response="I'm here to assist only with food delivery app support-related questions."
+#             )
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
 from fastapi import HTTPException
 from bson import ObjectId
 
 
-@app.get("/api/chats/sender/{user_id}/{sender_id}", response_model=list)
-def get_chats_by_sender(sender_id: str, user_id: str):
+@app.get("/api/chat_history/{friend_id}", response_model=list)
+def get_chat_history(friend_id: str, user: TokenData = Depends(get_current_user)):
     try:
-        print(f"sender_id: {sender_id}, user_id: {user_id}")
+        print(f"sender_id: {friend_id}, user_id: {user.email}")
         sender_docs = (
-            messages_collection.find({"sender": sender_id, "recipient": user_id})
-            .sort("timestamp", -1)
+            messages_collection.find({"sender": friend_id, "recipient": user.email})
+            .sort("timestamp", +1)
             .limit(10)
             .to_list()
         )
 
         user_docs = (
-            messages_collection.find({"recipient": sender_id, "sender": user_id})
-            .sort("timestamp", -1)
+            messages_collection.find({"recipient": friend_id, "sender": user.email})
+            .sort("timestamp", +1)
             .limit(10)
             .to_list()
         )
 
-        ##sorting sender docs and user docs together
         docs = sorted(
-            sender_docs + user_docs, key=lambda x: x["timestamp"], reverse=True
-        )  # Sort by created_at
+            sender_docs + user_docs, key=lambda x: x["timestamp"], reverse=False
+        )
 
         print(f"Found {len(docs)} documents")
         chats = []
         for chat in docs:
-            chat["_id"] = str(chat["_id"])  # Convert ObjectId to string
+            chat["_id"] = str(chat["_id"])
             chats.append(chat)
         return chats
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/recent_chats/{user_id}", response_model=list)
-def get_recent_chats(user_id: str):
+@app.get("/api/recent_chats", response_model=list)
+def get_recent_chats(user: TokenData = Depends(get_current_user)):
     try:
-        query = {"$or": [{"recipient": user_id}, {"sender": user_id}]}
-        docs = messages_collection.find(query).sort("timestamp", -1).limit(10).to_list()
+        print(f"user_id: {user.email}")
+        friend_requests = list(
+            friendrequests_collection.find(
+                {
+                    "$or": [{"sender": user.email}, {"recipient": user.email}],
+                    "accepted": True,
+                    "rejected": False,
+                }
+            )
+        )
 
-        # print(f"Found {docs.count()} documents")
+        chat_ids = []
+        for friend in friend_requests:
+            if friend["sender"] == user.email:
+                chat_ids.append(friend["recipient"])
+            else:
+                chat_ids.append(friend["sender"])
 
-        chat_ids = set()
-        for chat in docs:
-            chat_ids.add(chat["sender"])
-            chat_ids.add(chat["recipient"])
+        return JSONResponse(content=json.loads(json_util.dumps(chat_ids)))
+    except Exception as e:
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
-        # Remove the current user_id from the set if needed
-        chat_ids.discard(user_id)
 
-        return list(chat_ids)
+from datetime import datetime
+
+
+@app.post("/api/friend_requests/{friend_id}")
+def send_friend_request(friend_id: str, user: TokenData = Depends(get_current_user)):
+    try:
+        print(f"friend_id: {friend_id}")
+        friend = users_collection.find_one({"email": friend_id})
+        if not friend:
+            raise HTTPException(status_code=404, detail="Friend not found")
+        friendrequests_collection.insert_one(
+            {
+                "sender": user.email,
+                "recipient": friend_id,
+                "friend_name": user.username,
+                "accepted": False,
+                "rejected": False,
+                "timestamp": datetime.now(),
+            }
+        )
+        return {"message": "Friend request sent successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/friend_requests/{friend_id}/accept")
+def accept_friend_request(friend_id: str, user: TokenData = Depends(get_current_user)):
+    try:
+        print(f"friend_id: {friend_id}")
+        friendrequests_collection.update_one(
+            {"recipient": user.email, "sender": friend_id},
+            {"$set": {"accepted": True}},
+        )
+        return {"message": "Friend request accepted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/friend_requests/{friend_id}/reject")
+def reject_friend_request(friend_id: str, user: TokenData = Depends(get_current_user)):
+    try:
+        print(f"friend_id: {friend_id}")
+        friendrequests_collection.update_one(
+            {"recipient": user.email, "sender": friend_id},
+            {"$set": {"rejected": True}},
+        )
+        return {"message": "Friend request rejected successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+from fastapi.responses import JSONResponse
+from bson import json_util
+import json
+
+
+@app.get("/api/friend_requests")
+def get_friend_requests(user: TokenData = Depends(get_current_user)):
+    try:
+        print(f"user_id: {user.email}")
+        friend_requests = list(
+            friendrequests_collection.find(
+                {"recipient": user.email, "rejected": False, "accepted": False}
+            )
+        )
+        return JSONResponse(content=json.loads(json_util.dumps(friend_requests)))
+    except Exception as e:
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+@app.get("/api/find_friends/{friend_id}")
+def find_friends(friend_id: str):
+    try:
+        print(f"friend_id: {friend_id}")
+        friend_docs = list(users_collection.find({"email": friend_id}))
+        if len(friend_docs) == 0:
+            raise HTTPException(status_code=404, detail="Friend not found")
+
+        return JSONResponse(content=json.loads(json_util.dumps(friend_docs)))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+app.include_router(auth_router)
