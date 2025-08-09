@@ -1,5 +1,6 @@
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, List
+from pydantic import BaseModel, Field
 
 
 class QueryRequest(BaseModel):
@@ -14,4 +15,4 @@ class MenuItemResponse(BaseModel):
     image_url: HttpUrl
     packing_price: Optional[float] = 0.0
     is_veg: bool
-    is_out_of_stock: bool
+    is_out_of_stock: bool = Field(default=False)

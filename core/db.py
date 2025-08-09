@@ -19,7 +19,10 @@ products_collection = db["items"]
 
 
 def get_order(order_id: str):
-    return orders.find_one({"order_id": order_id})
+    print(f"order_id for orders: {order_id}")
+    res = orders.find_one({"order_id": str(order_id).strip()})
+    # print("orders:", res)
+    return res
 
 
 def get_orders_by_user(user_id: str):
