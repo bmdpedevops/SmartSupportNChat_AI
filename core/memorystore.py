@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Optional
 from core.db import msgs_db
 
 _state = msgs_db["chat_state"]
@@ -12,6 +13,6 @@ def set_last_order_id(user_id: str, order_id: str):
         upsert=True,
     )
 
-def get_last_order_id(user_id: str) -> str | None:
+def get_last_order_id(user_id: str) ->Optional[str]:
     doc = _state.find_one({"user_id": user_id}, {"last_order_id": 1})
     return (doc or {}).get("last_order_id")
