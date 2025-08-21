@@ -8,8 +8,7 @@ from core.db import (
     get_order_items,
 )
 from models.query_model import MenuItemResponse
-from core.db import db
-import json
+from core.db import db, orders
 
 orders_collection = db["orders"]
 products_collection = db["items"]
@@ -19,60 +18,53 @@ support_collection = db["support_tickets "]
 @tool
 def explain_capabilities(_=None) -> str:
     """
-    Explain what the assistant can do using its available tools.
+    Explain what the assistant can do - only when specifically asked.
     """
-    return """
-I can help you with a variety of customer support tasks. Here's what I can do:
+    return """I can help you with:
 
-📦 **Order & Delivery**
-- Check your order's delivery status
-- Get expected delivery time
-- Report delivery issues
-- Report missing or wrong items
-- Change delivery address
-- Report order not received
+📦 Order status & delivery tracking
+💸 Refunds & cancellations  
+🔍 Order details & product search
+🚚 Delivery issues & address changes
+👤 Connect you to human support
 
-💸 **Refunds & Cancellations**
-- Check refund eligibility
-- Cancel an order
-- Report payment issues
+What do you need help with?"""
 
-🔍 **Product & Order Info**
-- Search for products
-- Check order status
-- Get full order details
-
-Just ask what you need help with!
-"""
-
+@tool
+def ask_for_order_id(query: str) -> str:
+    """Ask user for order ID when they report issues but don't provide one."""
+    return "I'd be happy to help you with your order issue! 📦 Could you please share your order ID so I can look into the details for you?"
+import re
 
 @tool
 def check_order_delivery_status(order_id: str) -> str:
-    """
-    Check the delivery status of an order.
-
-    Args:
-        order_id (str): The ID of the order.
-
-    Returns:
-        str: Delivery status message.
-    """
+    """Check the delivery status of an order."""
     try:
         if not order_id:
-            return "Tool output: Please provide an order ID."
+            return "Please provide your order ID."
 
-        # Remove leading and trailing quotes (single or double)
-        order_id = order_id.strip("\"'")
-
+        order_id = str(order_id).strip("\"'")
         order = get_order(order_id)
+        
         if not order:
-            return "Tool output: Order not found."
+            return "Order not found. Please check your order ID."
 
-        return f"Tool output: Order status: {order['order_status']}"
-
+        order_status = order['order_status']
+        delivery_status = order.get('delivery_status', 'Pending')
+        vendor_status = order.get('vendor_status', 'N/A')
+        
+        # Check for delivery issues
+        delivery_issue = order.get('delivery_issue', '').strip()
+        issue_text = f"\n⚠️ Issue: {delivery_issue}" if delivery_issue else ""
+        
+        return f"""📦 Order #{order['order_id']}
+📊 Order Status: {order_status.title()}
+🚚 Delivery Status: {delivery_status}
+🏪 Vendor Status: {vendor_status}{issue_text}"""
+        
     except Exception as e:
-        return "Tool output: Invalid input format. Use 'order_id'."
-
+        print(f"Error in check_order_delivery_status: {e}")
+        return "Sorry, I couldn't check the delivery status. Please try again."
 
 # @tool
 # def get_orders_by_item_names_tool(input: str) -> str:
@@ -156,22 +148,29 @@ def search_products(product_name: str):
 
 @tool
 def check_order_status(order_id_user: str) -> str:
-    """
-    Check the status of a customer's order. Input format: 'order_id|user_id'
-    """
+    """Check the status of a customer's order. Input format: 'order_id|user_id'"""
     try:
-        order_id, user_id = order_id_user.split("|")
-        order_id = order_id.strip("\"'")
-        user_id = user_id.strip("\"'")
-        order = orders_collection.find_one(
-            {"order_id": order_id, "customer_id": user_id}
-        )
+        if '|' in order_id_user:
+            order_id, user_id = order_id_user.split("|", 1)
+        else:
+            order_id = order_id_user
+            user_id = None
+            
+        order_id = str(order_id).strip("\"'")
+        
+        if user_id:
+            order = orders.find_one({"order_id": order_id, "customer_id": user_id.strip("\"'")})
+        else:
+            order = get_order(order_id)
+            
         if not order:
-            return "Order not found for this user."
-        return "Tool output: Order status: " + order["order_status"]
-    except Exception:
-        return "Invalid input format. Use 'order_id|user_id'."
-
+            return "Order not found for this user." if user_id else "Order not found."
+            
+        return f"📦 Order #{order['order_id']} Status: {order['order_status'].title()}"
+        
+    except Exception as e:
+        print(f"Error checking order status: {e}")
+        return "Sorry, I couldn't check the order status."
 
 from pydantic import BaseModel
 
@@ -270,24 +269,31 @@ def request_address_change(data: str) -> str:
 
 @tool
 def cancel_order(order_id: str) -> str:
-    """
-    Cancel an order if it's not already delivered or canceled.
-
-    Args:
-        order_id (str): The ID of the order.
-
-    Returns:
-        str: Result of cancellation attempt.
-    """
-    order = get_order(order_id)
-    if not order:
-        return "Tool output: Order not found."
-    if order["order_status"] in ["Cancelled"]:
-        return "Tool output: This order cannot be canceled as it is already cancelled."
-    if order["order_status"] in ["Completed", "Delivered"]:
-        return "Tool output: This order cannot be canceled as it is already Delivered."
-    update_order_status(order_id, "cancelled")
-    return f"Tool output: Order {order_id} has been canceled successfully."
+    """Cancel an order if possible."""
+    try:
+        if not order_id:
+            return "Please provide an order ID."
+            
+        order_id = str(order_id).strip("\"'")
+        order = get_order(order_id)
+        
+        if not order:
+            return "Order not found."
+        
+        order_status = order['order_status'].lower()
+        
+        if order_status in ["cancelled", "canceled"]:
+            return f"Order #{order_id} is already cancelled."
+        elif order_status in ["completed", "delivered"]:
+            return f"Order #{order_id} cannot be cancelled as it's already {order_status}."
+        else:
+            # Cancel the order
+            update_order_status(order_id, "cancelled")
+            return f"✅ Order #{order_id} has been cancelled successfully. Refund will be processed within 3-5 business days."
+            
+    except Exception as e:
+        print(f"Error cancelling order: {e}")
+        return "Sorry, I couldn't cancel the order. Please contact support."
 
 
 @tool
@@ -307,25 +313,32 @@ def support_login_signup(data: str) -> str:
 
 @tool
 def check_refund_eligibility(order_id: str) -> str:
-    """
-    Check if an order is eligible for a refund.
-
-    Args:
-        order_id (str): The ID of the order.
-
-    Returns:
-        str: Refund eligibility status.
-    """
-    if not order_id:
-        return "Please provide an order ID."
-    order = get_order(order_id)
-    if not order:
-        return "Tool output: Order not found."
-    if order["vendor_status"] == "Cancelled":
-        return "Tool output : Your refund request is eligible and will be processed shortly."
-    elif order["order_status"] == "Delivered":
-        return "Tool output : Since the order was delivered, it is not eligible for a refund."
-    return "Tool output: Please wait for vendor confirmation to process refund."
+    """Check if an order is eligible for a refund."""
+    try:
+        if not order_id:
+            return "Please provide an order ID."
+        
+        order_id = str(order_id).strip("\"'")
+        order = get_order(order_id)
+        
+        if not order:
+            return "Order not found."
+        
+        order_status = order['order_status'].lower()
+        vendor_status = order.get('vendor_status', '').lower()
+        
+        if order_status == "cancelled":
+            return f"✅ Order #{order_id} is eligible for refund as it's cancelled. Refund will be processed within 3-5 business days."
+        elif order_status == "delivered":
+            return f"❌ Order #{order_id} was delivered, so it's not eligible for automatic refund. Please contact support if there were quality issues."
+        elif vendor_status == "accepted" and order_status not in ["delivered", "completed"]:
+            return f"⏳ Order #{order_id} can still be cancelled for a full refund. Would you like me to cancel it?"
+        else:
+            return f"⏳ Refund eligibility for order #{order_id} depends on vendor confirmation. Please wait or contact support."
+            
+    except Exception as e:
+        print(f"Error checking refund eligibility: {e}")
+        return "Sorry, I couldn't check refund eligibility. Please try again."
 
 
 def order_not_found(order_id: str) -> str:
@@ -343,19 +356,16 @@ def order_not_found(order_id: str) -> str:
 
 @tool
 def escalate_to_human(query: str) -> str:
-    """
-    Escalate an issue to a human agent.
-
-    Args:
-        query (str): The user's query or complaint.
-
-    Returns:
-        str: Escalation status.
-    """
-    agent = get_available_agent()
-    if agent:
-        return f"Your query is being assigned to our support agent {agent['name']}."
-    return "No support agents are available at the moment. Please try again later."
+    """Escalate an issue to a human agent."""
+    try:
+        agent = get_available_agent()
+        if agent:
+            agent_name = agent.get('name', agent.get('username', 'Support Agent'))
+            return f"🔄 I'm connecting you with our support agent {agent_name}. They'll help resolve your issue shortly!"
+        return "⏳ No support agents are currently available. I've logged your request and someone will contact you within 2 hours. Is there anything else I can help you with?"
+    except Exception as e:
+        print(f"Error escalating to human: {e}")
+        return "I'll make sure to escalate your request to our support team. They'll get back to you soon!"
 
 
 @tool
@@ -377,18 +387,29 @@ def report_delivery_issue(data: str) -> str:
 
 @tool
 def get_expected_delivery_time(order_id: str) -> str:
-    """
-    Get the estimated delivery time for an order.
-
-    Args:
-        order_id (str): The ID of the order.
-
-    Returns:
-        str: Expected delivery time.
-    """
-    if not order_exists(order_id):
-        return "Tool output: Order not found. Please provide a valid order ID."
-    return f"Tool output: Expected delivery time for order {order_id} takes around 2 - 3 hours."
+    """Get the estimated delivery time for an order."""
+    try:
+        if not order_id:
+            return "Please provide an order ID."
+            
+        order_id = str(order_id).strip("\"'")
+        order = get_order(order_id)
+        
+        if not order:
+            return "Order not found. Please provide a valid order ID."
+            
+        order_status = order['order_status'].lower()
+        
+        if order_status == "delivered":
+            return f"📦 Order #{order_id} has already been delivered!"
+        elif order_status == "cancelled":
+            return f"📦 Order #{order_id} was cancelled."
+        else:
+            return f"🕐 Order #{order_id} is expected to be delivered within 2-3 hours from order confirmation."
+            
+    except Exception as e:
+        print(f"Error getting delivery time: {e}")
+        return "Sorry, I couldn't get the delivery time estimate."
 
 
 def order_exists(order_id: str) -> bool:
@@ -488,30 +509,44 @@ def get_orders_by_time(data: str) -> str:
 
 @tool
 def get_order_by_id(order_id: str) -> str:
-    """
-    Get the details of an order by its ID.
+    """Get the details of an order by its ID."""
+    try:
+        if not order_id:
+            return "Please provide your order ID."
 
-    Args:
-        order_id (str): The ID of the order.
+        # Clean order_id
+        order_id = str(order_id).strip("\"'")
+        
+        order = get_order(order_id)
+        if not order:
+            return f"Order {order_id} not found. Please check your order ID."
 
-    Returns:
-        str: Order details.
-    """
-    if not order_id:
-        return "Please provide a valid order ID."
+        # Get items safely
+        items = get_order_items(order)
+        
+        # Format date safely - your order uses 'created_at'
+        try:
+            if 'created_at' in order and order['created_at']:
+                created_date = order['created_at'].strftime('%Y-%m-%d %H:%M')
+            else:
+                created_date = 'N/A'
+        except:
+            created_date = str(order.get('created_at', 'N/A'))
+        
+        total_amount = order.get('total_price', 0)
+        
+        return f"""📦 Order #{order['order_id']}
+📅 Date: {created_date}
+📊 Status: {order['order_status'].title()}
+🚚 Delivery: {order.get('delivery_status', 'Pending')}
+💰 Total: ₹{total_amount:.2f}
 
-    print(f"order_id: {order_id}")
-    order = get_order(order_id)
-    print(f"order: {order}")
+📋 Items:
+{items}
 
-    if not order:
-        return "Order not found."
-
-    return (
-        f"Tool output: Order ID: {order['order_id']}\n"
-        f"Order ID: {order['order_id']}\n"
-        f"Order Date: {order['created_at']}\n"
-        f"Order Items:\n{get_order_items(order)}\n"
-        f"Order Status: {order['order_status']}\n"
-        f"Total: ${order['total_price']}"
-    )
+🏪 Vendor Status: {order.get('vendor_status', 'N/A')}
+🍳 Cooking Instructions: {order.get('cooking_instructions', 'None')}"""
+        
+    except Exception as e:
+        print(f"Error in get_order_by_id: {e}")
+        return "Sorry, I couldn't retrieve the order details. Please try again."

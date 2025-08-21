@@ -23,14 +23,15 @@ def hash_password(plain_password):
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
-    if expires_delta:
-        expire = (
-            datetime.now().timestamp()
-            + timedelta(minutes=expires_delta).total_seconds()
-        )
-    else:
-        expire = datetime.now().timestamp() + timedelta(minutes=30).total_seconds()
-    to_encode.update({"exp": expire})
+    # removed expiry for testing
+    # if expires_delta:
+    #     expire = (
+    #         datetime.now().timestamp()
+    #         + timedelta(minutes=expires_delta).total_seconds()
+    #     )
+    # else:
+    #     expire = datetime.now().timestamp() + timedelta(minutes=30).total_seconds()
+    # to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, "$Trong##ecret", algorithm="HS256")
     return encoded_jwt
 

@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException
+from core.memorystore import get_last_order_id, set_last_order_id
 from models.query_model import QueryRequest
 from core.llm import groq_llm, anthropic_llm
 from core.tools import (
@@ -19,6 +20,7 @@ from core.tools import (
     check_order_status,
     get_order_by_id,
     explain_capabilities,
+    ask_for_order_id
 )
 from langchain.agents import initialize_agent, AgentType
 from langchain_core.tools import Tool
@@ -37,12 +39,17 @@ from langchain.callbacks.base import AsyncCallbackHandler
 
 
 class ToolUsageTracker(AsyncCallbackHandler):
-    def __init__(self):
+    def __init__(self, user_id: str):
         self.tool_used = False
+        self.user_id = user_id
 
     async def on_tool_start(self, serialized, input_str, **kwargs):
-        print(f"Tool started: {serialized.get('name')} with input: {input_str}")
         self.tool_used = True
+        name = (serialized or {}).get("name", "")
+        if name in {"get_order_by_id", "check_order_status", "check_refund_eligibility"}:
+            oid = str(input_str).strip().strip('"').strip("'")
+            if oid:
+                set_last_order_id(self.user_id, oid)
 
 
 def build_groq_agent(user_id: str, callbacks=None):
@@ -154,12 +161,19 @@ def build_groq_agent(user_id: str, callbacks=None):
 def build_agent(user_id: str, callbacks=None):
     tools = [
         Tool(
-            name="check_order_delivery_status",
-            func=check_order_delivery_status,
-            description="only to Check the delivery status of an order using its ID.it is not ued for checking order details",
+            name="ask_for_order_id",
+            func=ask_for_order_id,
+            description="Use ONLY when no ORDER_ID is present in the message AND there is no [CTX] ORDER_ID "
+        "in the input. If [CTX] ORDER_ID exists, use it instead of asking.",
+            # return_direct=True,
         ),
         Tool(
-            name="explain_capabilities",
+            name="check_order_delivery_status",
+            func=check_order_delivery_status,
+            description="Check the delivery status of an order using its ID.",
+        ),
+        Tool(
+            name="explain_capabilities", 
             func=explain_capabilities,
             description="Use this tool when the user asks what you can do, how you can help, or for an overview of your support capabilities.",
             return_direct=True,
@@ -167,7 +181,7 @@ def build_agent(user_id: str, callbacks=None):
         Tool(
             name="check_refund_eligibility",
             func=check_refund_eligibility,
-            description="only to Check if an order is eligible for a refund.it is not ued for checking order details",
+            description="Check if an order is eligible for a refund.",
         ),
         Tool(
             name="cancel_order",
@@ -177,7 +191,8 @@ def build_agent(user_id: str, callbacks=None):
         Tool(
             name="escalate_to_human",
             func=escalate_to_human,
-            description="Escalate the issue to a human support agent.",
+            description="Escalate the issue to a human support agent when user has complaints or needs human help.",
+            return_direct=True,
         ),
         Tool(
             name="report_delivery_issue",
@@ -213,7 +228,6 @@ def build_agent(user_id: str, callbacks=None):
             name="report_order_not_received",
             func=report_order_not_received,
             description="Report that the order has not been received.",
-            # return_direct=True,
         ),
         Tool(
             name="order_not_found",
@@ -223,7 +237,7 @@ def build_agent(user_id: str, callbacks=None):
         Tool(
             name="get_order_by_id",
             func=get_order_by_id,
-            description="check the order details for an order using its ID.",
+            description="Get order details using order ID.",
             return_direct=True,
         ),
         Tool(
@@ -238,24 +252,36 @@ def build_agent(user_id: str, callbacks=None):
         ),
     ]
 
+    ctx_id = get_last_order_id(user_id)
+    ctx_hint = f"\nIf user doesn't specify an order id in this turn, assume {ctx_id} by default unless they explicitly give a new one.\n" if ctx_id else ""
     prefix = f"""
-        You are a smart and friendly virtual assistant for customer support.
-        If the users query is not related to the tools, and related to greetings or other non-tool related queries, respond with a warm and friendly welcome.
-        or else use the tools or your own reasoning to provide accurate and helpful responses.
-        If the request is ambiguous or needs human judgment, escalate it using the `escalate_to_human` tool.
-        User ID: {user_id}
-    """
+You are a customer support assistant. Use the available tools to help users.
+
+IMPORTANT RULES:
+- If the input contains a bracketed context like "[CTX] ORDER_ID=...", TREAT THAT AS THE ORDER ID.
+- Do NOT ask for order id when [CTX] ORDER_ID is present.
+- Only use ask_for_order_id when neither the message nor [CTX] provide an id.
+- Prefer get_order_by_id / check_refund_eligibility with the contextual ORDER_ID.
+
+1. If user reports order issues but no order ID provided, use ask_for_order_id tool
+2. If user provides order ID (7-10 digits), use get_order_by_id tool  
+3. If user asks what you can do, use explain_capabilities tool
+4. Always use tools to respond, don't give direct answers
+5. Follow the exact format: Thought -> Action -> Action Input
+{ctx_hint}
+User ID: {user_id}
+"""
 
     return initialize_agent(
         tools=tools,
         llm=anthropic_llm,
         agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         verbose=True,
-        max_iterations=7,
+        max_iterations=3,
         agent_kwargs={"prefix": prefix},
         callbacks=callbacks or [],
         early_stopping_method="generate",
-        handle_parsing_errors=True,
+        handle_parsing_errors="Please use the format:\nThought: [your reasoning]\nAction: [tool_name]\nAction Input: [input]",
     )
 
 
@@ -283,41 +309,123 @@ async def classify_intent(user_query: str) -> str:
     """
     Classifies user intent using Groq LLM as 'tool' or 'chat'.
     """
+    # Quick keyword-based pre-check to avoid LLM calls for obvious cases
+    query_lower = user_query.lower().strip()
+    
+    # Check for order ID patterns
+    import re
+    has_order_id = bool(re.search(r'\b\d{7,10}\b', user_query))
+    
+    # If contains order ID, definitely tool
+    if has_order_id:
+        return "tool"
+    
+    # Pure greetings = chat
+    pure_chat = ["hi", "hello", "hey", "thanks", "thank you"]
+    if query_lower in pure_chat:
+        return "chat"
+    
+    # Order-related keywords = tool
+    tool_keywords = ["order", "delivery", "refund", "cancel", "status", "issue", "problem"]
+    if any(keyword in query_lower for keyword in tool_keywords):
+        return "tool"
+    
+    # Use Groq LLM for ambiguous cases
     prompt = f"""
-You are an intent classifier. Classify this message into EXACTLY one category:
+You are an AI assistant that classifies customer support queries into two categories:
+1. "tool" - The user wants to check or take action on an order, delivery, refund, payment, account issue, or anything that needs a defined support tool.
+2. "chat" - The user is just saying hi, asking what you can do, thanking, or asking a general question not tied to any tool.
 
-1. "chat" - Greetings, thanks, what can you do, general conversation
-2. "tool" - Order status, refund, cancel, delivery issues, order details, any specific action needed
+Only return **one word**: either "tool" or "chat". No explanation.
 
 Examples:
-- "hi" → chat
-- "hello" → chat  
-- "thanks" → chat
-- "what can you help me with" → chat
-- "where is my order" → tool
-- "order status for 123456" → tool
-- "cancel my order" → tool
-- "refund request" → tool
-- "my order is late" → tool
+- "Where is my order?" → tool
+- "Cancel my order" → tool
+- "Hi" → chat
+- "Thanks" → chat
+- "What can you do?" → tool
+- "here is the id 7251983047" → tool
 
-User message: "{user_query.strip()}"
-
-Respond with only one word: "chat" or "tool"
+Now classify this:
+"{user_query.strip()}"
 """
     
     response = await groq_llm.ainvoke(prompt)
     result = response.content.strip().lower()
-    
-    # More specific classification
-    chat_keywords = ["hi", "hello", "hey", "thanks", "thank you", "what can you do", "help me", "capabilities"]
-    tool_keywords = ["order", "refund", "cancel", "delivery", "status", "track", "issue", "problem"]
-    
-    if any(keyword in user_query.lower() for keyword in chat_keywords):
-        return "chat"
-    elif any(keyword in user_query.lower() for keyword in tool_keywords):
-        return "tool"
-    
     return "tool" if result == "tool" else "chat"
+
+import re
+
+async def enhance_query_with_order_id(user_query: str) -> str:
+    """
+    Extract order ID from user message if present, otherwise ask for it.
+    """
+    # Look for order ID patterns (numbers, could be 7-10 digits)
+    order_id_pattern = r'\b\d{7,10}\b'
+    matches = re.findall(order_id_pattern, user_query)
+    
+    if matches:
+        order_id = matches[0]
+        print(f"Found order ID: {order_id}")
+        return f"{user_query} [ORDER_ID: {order_id}]"
+    
+    # Check if they're asking about order but no ID found
+    order_related_keywords = ["order", "delivery", "status", "refund", "cancel", "track"]
+    if any(keyword in user_query.lower() for keyword in order_related_keywords):
+        if "order" in user_query.lower() and not matches:
+            return f"{user_query} [NOTE: Please ask for order ID if not provided]"
+    
+    return user_query
+
+def clean_tool_response(response: str) -> str:
+    """
+    Clean tool responses to be concise and user-friendly.
+    """
+    # Remove "Tool output:" prefix
+    response = response.replace("Tool output:", "").strip()
+    
+    # Remove excessive newlines
+    response = re.sub(r'\n+', '\n', response)
+    
+    # Limit response length
+    if len(response) > 500:
+        response = response[:500] + "..."
+    
+    return response
+
+# def enhance_query_for_agent(user_query: str) -> str:
+#     """Enhance query to help agent understand context better"""
+#     # Extract order ID if present
+#     import re
+#     order_ids = re.findall(r'\b\d{7,10}\b', user_query)
+    
+#     if order_ids:
+#         order_id = order_ids[0]
+#         return f"User query: {user_query}\nOrder ID found: {order_id}"
+    
+#     return user_query
+
+def enhance_query_for_agent(user_query: str, user_id: str) -> str:
+    ids = re.findall(r'\b\d{7,10}\b', user_query, flags=re.IGNORECASE)
+    if ids:
+        set_last_order_id(user_id, ids[0])
+        return f"{user_query}\n\n[CTX] Use ORDER_ID={ids[0]} if needed."
+    ctx = get_last_order_id(user_id)
+    if ctx:
+        return f"{user_query}\n\n[CTX] If the user refers to 'this order' without an ID, assume ORDER_ID={ctx}."
+    return user_query
+
+def clean_agent_response(response: str) -> str:
+    """Clean agent response to remove unnecessary parts"""
+    # Remove common agent artifacts
+    response = response.replace("Tool output:", "").strip()
+    response = response.replace("Final Answer:", "").strip()
+    
+    # Remove excessive newlines
+    import re
+    response = re.sub(r'\n+', '\n', response)
+    
+    return response.strip()
 
 
 @router.post("/chat_chatbot")
@@ -329,7 +437,7 @@ async def chat_with_bot(query: QueryRequest, user_id: str):
         print(f"Query classified as: {classification}")
 
         if classification == "chat":
-            # Directly use Groq LLM
+            # Use Groq LLM for simple chat
             prompt = f"""
             You are a friendly support chatbot.
 
@@ -341,17 +449,20 @@ async def chat_with_bot(query: QueryRequest, user_id: str):
             """
 
             response = await groq_llm.ainvoke(prompt)
-            # response = response.split("</think>")
             return {
                 "response": (
                     response.content if hasattr(response, "content") else str(response)
                 )
             }
 
-        # Else use Anthropic Agent with tools
-        tracker = ToolUsageTracker()
+        # Use Anthropic Agent with tools for tool-related queries
+        tracker = ToolUsageTracker(user_id)
         agent = build_agent(user_id, callbacks=[tracker])
-        response = await agent.ainvoke({"input": query.user_query})
+        
+        # Enhance query to help agent understand context
+        enhanced_query = enhance_query_for_agent(query.user_query, user_id)
+        
+        response = await agent.ainvoke({"input": enhanced_query})
 
         if isinstance(response, dict) and "output" in response:
             final_output = response["output"]
@@ -360,12 +471,12 @@ async def chat_with_bot(query: QueryRequest, user_id: str):
         else:
             final_output = str(response)
 
-        # summarized = await summarize_response(final_output, query.user_query)
-        return {"response": final_output}
+        # Clean the response
+        cleaned_response = clean_agent_response(final_output)
+        return {"response": cleaned_response}
 
     except Exception as e:
         print(f"Exception: {e}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
-
 
 # scp -i "D:\AMG Projects\Chatbot_Advanced\grocify.pem" -r "D:\AMG Projects\Chatbot_Advanced\wheels" ec2-user@ec2-13-233-43-192.ap-south-1.compute.amazonaws.com:~
