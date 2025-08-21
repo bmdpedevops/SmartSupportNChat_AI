@@ -534,6 +534,7 @@ def get_order_by_id(order_id: str) -> str:
             created_date = str(order.get('created_at', 'N/A'))
         
         total_amount = order.get('total_price', 0)
+        #test
         
         return f"""📦 Order #{order['order_id']}
 📅 Date: {created_date}
